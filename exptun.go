@@ -27,7 +27,7 @@ func checksum(b []byte) uint16 {
 
 	for i := 0; i < len(b); i += 2 {
 		if i == len(b)-1 {
-			sum += uint32(b[i])
+			sum += uint32(b[i]) << 8
 		} else {
 			sum += uint32(binary.BigEndian.Uint16(b[i:]))
 		}
