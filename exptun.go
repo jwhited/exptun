@@ -80,7 +80,7 @@ func natPacket(b []byte, tunAddr, tunRoute netip.Prefix) ([]byte, bool) {
 	copy(tcpCsumData[:4], b[12:16])   // srcAddr
 	copy(tcpCsumData[4:], b[16:20])   // dstAddr
 	tcpCsumData[9] = unix.IPPROTO_TCP // protocol
-	binary.BigEndian.PutUint16(b[10:], uint16(len(b[20:])))
+	binary.BigEndian.PutUint16(tcpCsumData[10:], uint16(len(b[20:])))
 	copy(tcpCsumData[12:], b[20:])
 	tcpCsum := checksum(tcpCsumData)
 	binary.BigEndian.PutUint16(b[20+16:], tcpCsum)
