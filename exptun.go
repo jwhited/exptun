@@ -13,18 +13,18 @@ import (
 )
 
 var (
-	flagTunName  = flag.String("tun-name", "exptun", "name of TUN device")
-	flagTunAddr  = flag.String("tun-addr", "172.16.255.1/32", "address of TUN device")
-	flagTunRoute = flag.String("tun-route", "172.16.255.2/32", "route towards TUN device")
-	flagTunTSO   = flag.Bool("tun-tso", false, "enable TSO for TUN device")
+	flagTunName    = flag.String("tun-name", "exptun", "name of TUN device")
+	flagTunAddr    = flag.String("tun-addr", "172.16.255.1/32", "address of TUN device")
+	flagTunRoute   = flag.String("tun-route", "172.16.255.2/32", "route towards TUN device")
+	flagTunTSOMode = flag.Int("tun-tso-mode", 0, "0 (off); 1 (echo); 2 (split)")
 )
 
 const (
 	tunPath = "/dev/net/tun"
 )
 
-func checksum(b []byte) uint16 {
-	var sum uint32
+func checksum(b []byte, initial uint32) uint16 {
+	sum := initial
 
 	for i := 0; i < len(b); i += 2 {
 		if i == len(b)-1 {
@@ -48,6 +48,15 @@ const (
 	virtioNetHdrLen = 10
 )
 
+const (
+	// virtioNetHdr Flags
+	VIRTIO_NET_HDR_F_NEEDS_CSUM = 0x1
+
+	// virtioNetHdr GSOType
+	VIRTIO_NET_HDR_GSO_NONE  = 0x0
+	VIRTIO_NET_HDR_GSO_TCPV4 = 0x1
+)
+
 type virtioNetHdr struct {
 	Flags      uint8
 	GSOType    uint8
@@ -57,68 +66,96 @@ type virtioNetHdr struct {
 	CSumOffset uint16
 }
 
-// handlePacket handles the provided packet, returning a modified packet and
-// true if it should be written back to the TUN, otherwise nil, false.
-func handlePacket(b []byte, tunAddr, tunRoute netip.Prefix, tso bool) ([]byte, bool) {
-	var vnetHdr virtioNetHdr
-	if tso {
-		if len(b) < virtioNetHdrLen {
-			return nil, false
-		}
-		// TODO: probably shouldn't construct a new reader per-packet
-		err := binary.Read(bytes.NewReader(b[:virtioNetHdrLen]), binary.LittleEndian, &vnetHdr)
-		if err != nil {
-			return nil, false
-		}
-		b = b[virtioNetHdrLen:]
-	}
-	// NAT packets from address behind TUN device
-	if len(b) < 40 {
-		return nil, false
-	}
-	if b[0]>>4 != 4 { // only IPv4 for now
-		return nil, false
-	}
-	if b[0]&0x0F != 5 { // ignore ip options for now
-		return nil, false
-	}
-	if b[9] != unix.IPPROTO_TCP { // ignore non-tcp
-		return nil, false
-	}
-	srcAddr, _ := netip.AddrFromSlice(b[12:16])
-	dstAddr, _ := netip.AddrFromSlice(b[16:20])
-	if srcAddr.Compare(tunAddr.Addr()) != 0 {
-		return nil, false
-	}
-	if !tunRoute.Contains(dstAddr) {
-		return nil, false
-	}
-	// swap src/dst addrs
-	copy(b[12:16], dstAddr.AsSlice())
-	copy(b[16:20], srcAddr.AsSlice())
+type packetHandler struct {
+	reader            *bytes.Reader
+	tunAddr, tunRoute netip.Prefix
+	mode              tsoMode
+}
 
-	// IPv4 header checksum
-	b[10], b[11] = 0, 0 // clear
-	ipv4Csum := checksum(b[:20])
-	binary.BigEndian.PutUint16(b[10:12], ipv4Csum)
+func pseudoHeaderMinusLenFromPacket(b []byte) []byte {
+	ret := make([]byte, 10)
+	copy(ret[:4], b[12:16])
+	copy(ret[4:], b[16:20])
+	ret[9] = unix.IPPROTO_TCP
+	return ret
+}
 
-	// TCP header checksum
-	b[20+16], b[20+17] = 0, 0 // clear
-	tcpCsumData := make([]byte, 12+len(b[20:]))
-	copy(tcpCsumData[:4], b[12:16])   // srcAddr
-	copy(tcpCsumData[4:], b[16:20])   // dstAddr
-	tcpCsumData[9] = unix.IPPROTO_TCP // protocol
+func tcpChecksum(b []byte, pseudoHeaderMinusLen []byte) uint16 {
+	b[16], b[17] = 0, 0 // clear
+	tcpCsumData := make([]byte, len(pseudoHeaderMinusLen)+2+len(b[20:]))
+	copy(tcpCsumData, pseudoHeaderMinusLen)
 	binary.BigEndian.PutUint16(tcpCsumData[10:], uint16(len(b[20:])))
 	copy(tcpCsumData[12:], b[20:])
-	tcpCsum := checksum(tcpCsumData)
-	binary.BigEndian.PutUint16(b[20+16:], tcpCsum)
+	tcpCsum := checksum(tcpCsumData, 0)
+	return tcpCsum
+}
 
-	if tso {
-		emptyVnetHdr := make([]byte, virtioNetHdrLen)
-		b = append(emptyVnetHdr, b...)
+// handlePacket handles the provided packet, returning true if it should be
+// written back to the TUN device.
+func (p *packetHandler) handle(b []byte) bool {
+	p.reader.Reset(b)
+	var vnetHdr virtioNetHdr
+	startAtIPH := b
+
+	if p.mode > tsoModeOff {
+		if len(b) < virtioNetHdrLen {
+			return false
+		}
+		err := binary.Read(p.reader, binary.LittleEndian, &vnetHdr)
+		if err != nil {
+			return false
+		}
+		if vnetHdr.GSOType != VIRTIO_NET_HDR_GSO_NONE && vnetHdr.GSOType != VIRTIO_NET_HDR_GSO_TCPV4 {
+			return false
+		}
+		startAtIPH = b[virtioNetHdrLen:]
 	}
 
-	return b, true
+	// NAT packets from address behind TUN device
+	if len(startAtIPH) < 40 {
+		return false
+	}
+	if startAtIPH[0]>>4 != 4 { // only IPv4 for now
+		return false
+	}
+	if startAtIPH[0]&0x0F != 5 { // ignore ip options for now
+		return false
+	}
+	if startAtIPH[9] != unix.IPPROTO_TCP { // ignore non-tcp
+		return false
+	}
+	srcAddr, _ := netip.AddrFromSlice(startAtIPH[12:16])
+	dstAddr, _ := netip.AddrFromSlice(startAtIPH[16:20])
+	if srcAddr.Compare(p.tunAddr.Addr()) != 0 {
+		return false
+	}
+	if !p.tunRoute.Contains(dstAddr) {
+		return false
+	}
+	// swap src/dst addrs
+	copy(startAtIPH[12:16], dstAddr.AsSlice())
+	copy(startAtIPH[16:20], srcAddr.AsSlice())
+
+	if p.mode == tsoModeOff || p.mode == tsoModeEcho {
+		return true
+	}
+
+	// IPv4 header checksum
+	b[10], b[11] = 0, 0 // clear IPv4 checksum field
+	ipv4Csum := checksum(b[:20], 0)
+	binary.BigEndian.PutUint16(b[10:12], ipv4Csum) // set IPv4 csum
+
+	// psuedoheaderMinusLen for tcp checksum. We don't want len (yet) as it may
+	// vary for final segment.
+	psuedoHeaderMinusLen := pseudoHeaderMinusLenFromPacket(startAtIPH)
+
+	tcpCsumAt := vnetHdr.CSumStart + vnetHdr.CSumOffset
+	b[tcpCsumAt], b[tcpCsumAt+1] = 0, 0 // clear TCP checksum field before splitting
+
+	// TODO: split segments
+	_ = psuedoHeaderMinusLen
+
+	return true
 }
 
 func run(prog string, args ...string) error {
@@ -129,6 +166,31 @@ func run(prog string, args ...string) error {
 		return fmt.Errorf("error running %v: %v", cmd, err)
 	}
 	return nil
+}
+
+type tsoMode int
+
+const (
+	tsoModeOff   tsoMode = 0
+	tsoModeEcho  tsoMode = 1
+	tsoModeSplit tsoMode = 2
+)
+
+func (t tsoMode) valid() bool {
+	return t >= 0 && t <= 2
+}
+
+func (t tsoMode) String() string {
+	switch t {
+	case tsoModeOff:
+		return "off"
+	case tsoModeEcho:
+		return "echo"
+	case tsoModeSplit:
+		return "split"
+	default:
+		return "unknown"
+	}
 }
 
 func main() {
@@ -143,7 +205,12 @@ func main() {
 		log.Fatalf("error parsing tun route (%s): %v", *flagTunRoute, err)
 	}
 
-	fd, err := setupDevice(*flagTunName, *flagTunTSO)
+	mode := tsoMode(*flagTunTSOMode)
+	if !mode.valid() {
+		log.Fatalf("invalid tso mode: %d", *flagTunTSOMode)
+	}
+
+	fd, err := setupDevice(*flagTunName, mode != tsoModeOff)
 	if err != nil {
 		log.Fatalf("error setting up TUN device: %v", err)
 	}
@@ -167,16 +234,22 @@ func main() {
 	}
 
 	b := make([]byte, 65535)
+	handler := &packetHandler{
+		reader:   bytes.NewReader(b),
+		tunAddr:  tunAddr,
+		tunRoute: tunRoute,
+		mode:     mode,
+	}
 	for {
 		n, err := f.Read(b)
 		if err != nil {
 			log.Fatalf("error reading from TUN: %v", err)
 		}
-		c, ok := handlePacket(b[:n], tunAddr, tunRoute, *flagTunTSO)
+		ok := handler.handle(b[:n])
 		if !ok {
 			continue
 		}
-		_, err = f.Write(c)
+		_, err = f.Write(b[:n])
 		if err != nil {
 			log.Fatalf("error writing to TUN: %v", err)
 		}
