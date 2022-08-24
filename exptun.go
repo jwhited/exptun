@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -43,7 +44,34 @@ func checksum(b []byte) uint16 {
 	return uint16(^sum)
 }
 
-func natPacket(b []byte, tunAddr, tunRoute netip.Prefix) ([]byte, bool) {
+const (
+	virtioNetHdrLen = 10
+)
+
+type virtioNetHdr struct {
+	Flags      uint8
+	GSOType    uint8
+	HdrLen     uint16
+	GSOSize    uint16
+	CSumStart  uint16
+	CSumOffset uint16
+}
+
+// handlePacket handles the provided packet, returning a modified packet and
+// true if it should be written back to the TUN, otherwise nil, false.
+func handlePacket(b []byte, tunAddr, tunRoute netip.Prefix, tso bool) ([]byte, bool) {
+	var vnetHdr virtioNetHdr
+	if tso {
+		if len(b) < virtioNetHdrLen {
+			return nil, false
+		}
+		// TODO: probably shouldn't construct a new reader per-packet
+		err := binary.Read(bytes.NewReader(b[:virtioNetHdrLen]), binary.LittleEndian, &vnetHdr)
+		if err != nil {
+			return nil, false
+		}
+		b = b[virtioNetHdrLen:]
+	}
 	// NAT packets from address behind TUN device
 	if len(b) < 40 {
 		return nil, false
@@ -84,6 +112,11 @@ func natPacket(b []byte, tunAddr, tunRoute netip.Prefix) ([]byte, bool) {
 	copy(tcpCsumData[12:], b[20:])
 	tcpCsum := checksum(tcpCsumData)
 	binary.BigEndian.PutUint16(b[20+16:], tcpCsum)
+
+	if tso {
+		emptyVnetHdr := make([]byte, virtioNetHdrLen)
+		b = append(emptyVnetHdr, b...)
+	}
 
 	return b, true
 }
@@ -133,26 +166,19 @@ func main() {
 		log.Fatalf("error adding route to TUN: %v", err)
 	}
 
-	go func() {
-		b := make([]byte, 65535)
-		for {
-			n, err := f.Read(b)
-			if err != nil {
-				log.Fatalf("error reading from TUN: %v", err)
-			}
-			if n > 1500 {
-				panic(fmt.Sprintf("got packet > 1500 bytes (%d)", n))
-			}
-			c, ok := natPacket(b[:n], tunAddr, tunRoute)
-			if !ok {
-				continue
-			}
-			_, err = f.Write(c)
-			if err != nil {
-				log.Fatalf("error writing to TUN: %v", err)
-			}
+	b := make([]byte, 65535)
+	for {
+		n, err := f.Read(b)
+		if err != nil {
+			log.Fatalf("error reading from TUN: %v", err)
 		}
-	}()
-
-	select {}
+		c, ok := handlePacket(b[:n], tunAddr, tunRoute, *flagTunTSO)
+		if !ok {
+			continue
+		}
+		_, err = f.Write(c)
+		if err != nil {
+			log.Fatalf("error writing to TUN: %v", err)
+		}
+	}
 }

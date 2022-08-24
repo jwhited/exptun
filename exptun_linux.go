@@ -18,7 +18,11 @@ func setupDevice(name string, tso bool) (fd int, err error) {
 	}
 
 	// Flags are stored as a uint16 in the ifreq union.
-	iffIfreq.SetUint16(unix.IFF_TUN | unix.IFF_NO_PI)
+	var flags uint16 = unix.IFF_TUN | unix.IFF_NO_PI
+	if tso {
+		flags |= unix.IFF_VNET_HDR
+	}
+	iffIfreq.SetUint16(flags)
 	if err = unix.IoctlIfreq(fd, unix.TUNSETIFF, iffIfreq); err != nil {
 		return 0, fmt.Errorf("ioctlifreq TUNSETIFF err: %v", err)
 	}
