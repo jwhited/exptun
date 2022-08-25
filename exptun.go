@@ -90,72 +90,88 @@ func tcpChecksum(b []byte, pseudoHeaderMinusLen []byte) uint16 {
 	return tcpCsum
 }
 
-// handlePacket handles the provided packet, returning true if it should be
-// written back to the TUN device.
-func (p *packetHandler) handle(b []byte) bool {
-	p.reader.Reset(b)
+// handle handles the provided packet 'in'. If handle results in packets that
+// should be written to the TUN device it will return true, with the packets
+// written to out, and their sizes in the returned slice of ints.
+func (p *packetHandler) handle(in []byte, out [][]byte) ([]int, bool) {
+	p.reader.Reset(in)
 	var vnetHdr virtioNetHdr
-	startAtIPH := b
+	startAtIPH := in
 
 	if p.mode > tsoModeOff {
-		if len(b) < virtioNetHdrLen {
-			return false
+		if len(in) < virtioNetHdrLen {
+			return nil, false
 		}
 		err := binary.Read(p.reader, binary.LittleEndian, &vnetHdr)
 		if err != nil {
-			return false
+			return nil, false
 		}
 		if vnetHdr.GSOType != VIRTIO_NET_HDR_GSO_NONE && vnetHdr.GSOType != VIRTIO_NET_HDR_GSO_TCPV4 {
-			return false
+			return nil, false
 		}
-		startAtIPH = b[virtioNetHdrLen:]
+		startAtIPH = in[virtioNetHdrLen:]
 	}
 
 	// NAT packets from address behind TUN device
 	if len(startAtIPH) < 40 {
-		return false
+		return nil, false
 	}
 	if startAtIPH[0]>>4 != 4 { // only IPv4 for now
-		return false
+		return nil, false
 	}
 	if startAtIPH[0]&0x0F != 5 { // ignore ip options for now
-		return false
+		return nil, false
 	}
 	if startAtIPH[9] != unix.IPPROTO_TCP { // ignore non-tcp
-		return false
+		return nil, false
 	}
 	srcAddr, _ := netip.AddrFromSlice(startAtIPH[12:16])
 	dstAddr, _ := netip.AddrFromSlice(startAtIPH[16:20])
 	if srcAddr.Compare(p.tunAddr.Addr()) != 0 {
-		return false
+		return nil, false
 	}
 	if !p.tunRoute.Contains(dstAddr) {
-		return false
+		return nil, false
 	}
 	// swap src/dst addrs
 	copy(startAtIPH[12:16], dstAddr.AsSlice())
 	copy(startAtIPH[16:20], srcAddr.AsSlice())
 
-	if p.mode == tsoModeOff || p.mode == tsoModeEcho {
-		return true
+	if p.mode < tsoModeSplit || vnetHdr.GSOType == VIRTIO_NET_HDR_GSO_NONE {
+		copy(out[0], in)
+		return []int{len(in)}, true
 	}
 
-	// IPv4 header checksum
-	b[10], b[11] = 0, 0 // clear IPv4 checksum field
-	ipv4Csum := checksum(b[:20], 0)
-	binary.BigEndian.PutUint16(b[10:12], ipv4Csum) // set IPv4 csum
+	startAtIPH[10], startAtIPH[11] = 0, 0 // clear IPv4 checksum field
 
 	// psuedoheaderMinusLen for tcp checksum. We don't want len (yet) as it may
 	// vary for final segment.
 	psuedoHeaderMinusLen := pseudoHeaderMinusLenFromPacket(startAtIPH)
 
 	tcpCsumAt := vnetHdr.CSumStart + vnetHdr.CSumOffset
-	b[tcpCsumAt], b[tcpCsumAt+1] = 0, 0 // clear TCP checksum field before splitting
+	in[tcpCsumAt], in[tcpCsumAt+1] = 0, 0 // clear TCP checksum field before splitting
 
 	// TODO: split segments
 	_ = psuedoHeaderMinusLen
+	nextSegmentAt := virtioNetHdrLen + int(vnetHdr.HdrLen)
+	sizes := make([]int, 0, len(out))
+	for i := 0; nextSegmentAt < len(in); i++ {
+		fmt.Printf("len(in): %d nextSegmentAt: %d\n", len(in), nextSegmentAt)
+		copy(out[i], make([]byte, virtioNetHdrLen))                             // empty virtioNetHdr
+		copy(out[i][virtioNetHdrLen:], in[:20])                                 // ipv4 header
+		copy(out[i][virtioNetHdrLen+20:], in[vnetHdr.CSumStart:vnetHdr.HdrLen]) // tcp header
 
-	return true
+		// TODO: set IPv4 header len
+		// TODO: set TCP sequence number
+		// TODO: set TCP len
+		// TODO: TCP checksum
+
+		// payload varies
+		copy(out[i][vnetHdr.HdrLen:], in[nextSegmentAt:])                                    // payload
+		sizes = append(sizes, virtioNetHdrLen+20+int(vnetHdr.HdrLen)-int(vnetHdr.CSumStart)) // virtioNetHdr + iph len + tcph len + payload len
+		nextSegmentAt += int(vnetHdr.GSOSize)
+	}
+	return sizes, true
 }
 
 func run(prog string, args ...string) error {
@@ -233,25 +249,37 @@ func main() {
 		log.Fatalf("error adding route to TUN: %v", err)
 	}
 
-	b := make([]byte, 65535)
+	const (
+		mtu            = 1500
+		maxSegmentSize = 65535
+		maxSegments    = maxSegmentSize/mtu + 1
+	)
+	in := make([]byte, maxSegmentSize)
+	out := make([][]byte, maxSegments)
+	for i := 0; i < len(out); i++ {
+		out[i] = make([]byte, maxSegmentSize)
+	}
 	handler := &packetHandler{
-		reader:   bytes.NewReader(b),
+		reader:   bytes.NewReader(nil),
 		tunAddr:  tunAddr,
 		tunRoute: tunRoute,
 		mode:     mode,
 	}
 	for {
-		n, err := f.Read(b)
+		n, err := f.Read(in)
 		if err != nil {
 			log.Fatalf("error reading from TUN: %v", err)
 		}
-		ok := handler.handle(b[:n])
+		sizes, ok := handler.handle(in[:n], out)
 		if !ok {
 			continue
 		}
-		_, err = f.Write(b[:n])
-		if err != nil {
-			log.Fatalf("error writing to TUN: %v", err)
+		for i := 0; i < len(sizes); i++ {
+			_, err = f.Write(out[i][:sizes[i]])
+			if err != nil {
+				log.Fatalf("error writing to TUN: %v", err)
+			}
 		}
+
 	}
 }
