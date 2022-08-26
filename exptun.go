@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"flag"
@@ -19,7 +18,7 @@ var (
 	flagTunName    = flag.String("tun-name", "exptun", "name of TUN device")
 	flagTunAddr    = flag.String("tun-addr", "172.16.255.1/32", "address of TUN device")
 	flagTunRoute   = flag.String("tun-route", "172.16.255.2/32", "route towards TUN device")
-	flagTunTSOMode = flag.Int("tun-tso-mode", 0, "0 (off); 1 (echo); 2 (split)")
+	flagTunTSOMode = flag.Int("tun-tso-mode", 0, "0 (off); 1 (echo); 2 (split); 3 (split no csum)")
 	flagPprofAddr  = flag.String("pprof-addr", "", "pprof http server listen addr")
 )
 
@@ -72,6 +71,19 @@ type virtioNetHdr struct {
 	CSumOffset uint16
 }
 
+func (v *virtioNetHdr) encode(bo binary.ByteOrder, b []byte) error {
+	if len(b) < virtioNetHdrLen {
+		return errors.New("too short")
+	}
+	b[0] = v.Flags
+	b[1] = v.GSOType
+	bo.PutUint16(b[2:], v.HdrLen)
+	bo.PutUint16(b[2:], v.GSOSize)
+	bo.PutUint16(b[2:], v.CSumStart)
+	bo.PutUint16(b[2:], v.CSumOffset)
+	return nil
+}
+
 func (v *virtioNetHdr) decode(bo binary.ByteOrder, b []byte) error {
 	if len(b) < virtioNetHdrLen {
 		return errors.New("too shor")
@@ -86,7 +98,6 @@ func (v *virtioNetHdr) decode(bo binary.ByteOrder, b []byte) error {
 }
 
 type packetHandler struct {
-	reader            *bytes.Reader
 	tunAddr, tunRoute netip.Prefix
 	mode              tsoMode
 	buff              [65535]byte
@@ -94,20 +105,10 @@ type packetHandler struct {
 	sizes             []int
 }
 
-func genTCP4PseudoHeader(src, dst [4]byte, tcpLen uint16) []byte {
-	ret := make([]byte, 12)
-	copy(ret[:4], src[:])
-	copy(ret[4:], dst[:])
-	ret[9] = unix.IPPROTO_TCP
-	binary.BigEndian.PutUint16(ret[10:], tcpLen)
-	return ret
-}
-
 // handle handles the provided packet 'in'. If handle results in packets that
 // should be written to the TUN device it will return true, with the packets
 // written to out, and their sizes in the returned slice of ints.
 func (p *packetHandler) handle(in []byte, out [][]byte) ([]int, bool) {
-	p.reader.Reset(in)
 	var vnetHdr virtioNetHdr
 	var ipHLen int
 	inStartAtIPH := in
@@ -151,10 +152,12 @@ func (p *packetHandler) handle(in []byte, out [][]byte) ([]int, bool) {
 
 	inStartAtIPH[10], inStartAtIPH[11] = 0, 0 // clear IPv4 checksum field
 
-	copy(p.psuedoHeader[:], inStartAtIPH[12:16])
-	copy(p.psuedoHeader[4:], inStartAtIPH[16:20])
-	p.psuedoHeader[9] = unix.IPPROTO_TCP
-	p.psuedoHeader[10], p.psuedoHeader[11] = 0, 0
+	if p.mode == tsoModeSplit {
+		copy(p.psuedoHeader[:], inStartAtIPH[12:16])
+		copy(p.psuedoHeader[4:], inStartAtIPH[16:20])
+		p.psuedoHeader[9] = unix.IPPROTO_TCP
+		p.psuedoHeader[10], p.psuedoHeader[11] = 0, 0
+	}
 
 	tcpCsumAt := virtioNetHdrLen + vnetHdr.CSumStart + vnetHdr.CSumOffset
 	in[tcpCsumAt], in[tcpCsumAt+1] = 0, 0 // clear TCP checksum field before splitting
@@ -169,8 +172,15 @@ func (p *packetHandler) handle(in []byte, out [][]byte) ([]int, bool) {
 		}
 
 		// empty virtioNetHdr
-		for j := 0; j < virtioNetHdrLen; j++ {
-			out[i][j] = 0
+		outVNetHdr := virtioNetHdr{}
+		if p.mode == tsoModeSplitNoCsum {
+			outVNetHdr.Flags = VIRTIO_NET_HDR_F_NEEDS_CSUM
+			outVNetHdr.CSumStart = 20
+			outVNetHdr.CSumOffset = 16
+		}
+		err := outVNetHdr.encode(binary.LittleEndian, out[i])
+		if err != nil {
+			return nil, false
 		}
 
 		// IPv4 header
@@ -178,6 +188,8 @@ func (p *packetHandler) handle(in []byte, out [][]byte) ([]int, bool) {
 		copy(out[i][startAtIPH:], inStartAtIPH[:20])
 		totalLen := int(vnetHdr.HdrLen) + (end - nextSegmentAt)
 		binary.BigEndian.PutUint16(out[i][startAtIPH+2:], uint16(totalLen))
+		// When splitting we always want to compute a valid iph checksum. We
+		// can't offload this back to the kernel.
 		ipv4CSum := checksum(out[i][startAtIPH : startAtIPH+20])
 		binary.BigEndian.PutUint16(out[i][startAtIPH+10:], ipv4CSum)
 
@@ -194,13 +206,15 @@ func (p *packetHandler) handle(in []byte, out [][]byte) ([]int, bool) {
 		copy(out[i][virtioNetHdrLen+vnetHdr.HdrLen:], in[nextSegmentAt:end])
 
 		// TCP checksum
-		tcpHLen := int(vnetHdr.HdrLen) - ipHLen
-		tcpLenForPseudo := tcpHLen + (end - nextSegmentAt)
-		binary.BigEndian.PutUint16(p.psuedoHeader[10:], uint16(tcpLenForPseudo))
-		copy(p.buff[:], p.psuedoHeader[:])
-		copy(p.buff[len(p.psuedoHeader):], out[i][startAtTCP:])
-		tcpCSum := checksum(p.buff[:len(p.psuedoHeader)+len(out[i][startAtTCP:])])
-		binary.BigEndian.PutUint16(out[i][startAtTCP+16:], tcpCSum)
+		if p.mode == tsoModeSplit {
+			tcpHLen := int(vnetHdr.HdrLen) - ipHLen
+			tcpLenForPseudo := tcpHLen + (end - nextSegmentAt)
+			binary.BigEndian.PutUint16(p.psuedoHeader[10:], uint16(tcpLenForPseudo))
+			copy(p.buff[:], p.psuedoHeader[:])
+			copy(p.buff[len(p.psuedoHeader):], out[i][startAtTCP:])
+			tcpCSum := checksum(p.buff[:len(p.psuedoHeader)+len(out[i][startAtTCP:])])
+			binary.BigEndian.PutUint16(out[i][startAtTCP+16:], tcpCSum)
+		}
 
 		p.sizes[i] = virtioNetHdrLen + totalLen
 		numSegments++
@@ -222,13 +236,14 @@ func run(prog string, args ...string) error {
 type tsoMode int
 
 const (
-	tsoModeOff   tsoMode = 0
-	tsoModeEcho  tsoMode = 1
-	tsoModeSplit tsoMode = 2
+	tsoModeOff         tsoMode = 0
+	tsoModeEcho        tsoMode = 1
+	tsoModeSplit       tsoMode = 2
+	tsoModeSplitNoCsum tsoMode = 3
 )
 
 func (t tsoMode) valid() bool {
-	return t >= 0 && t <= 2
+	return t >= 0 && t <= 3
 }
 
 func (t tsoMode) String() string {
@@ -239,6 +254,8 @@ func (t tsoMode) String() string {
 		return "echo"
 	case tsoModeSplit:
 		return "split"
+	case tsoModeSplitNoCsum:
+		return "split-no-csum"
 	default:
 		return "unknown"
 	}
@@ -296,7 +313,6 @@ func main() {
 		out[i] = make([]byte, 65535)
 	}
 	handler := &packetHandler{
-		reader:   bytes.NewReader(nil),
 		tunAddr:  tunAddr,
 		tunRoute: tunRoute,
 		mode:     mode,
@@ -317,6 +333,5 @@ func main() {
 				log.Fatalf("error writing to TUN: %v", err)
 			}
 		}
-
 	}
 }
