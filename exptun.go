@@ -3,10 +3,13 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"golang.org/x/sys/unix"
 	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -17,6 +20,7 @@ var (
 	flagTunAddr    = flag.String("tun-addr", "172.16.255.1/32", "address of TUN device")
 	flagTunRoute   = flag.String("tun-route", "172.16.255.2/32", "route towards TUN device")
 	flagTunTSOMode = flag.Int("tun-tso-mode", 0, "0 (off); 1 (echo); 2 (split)")
+	flagPprofAddr  = flag.String("pprof-addr", "", "pprof http server listen addr")
 )
 
 const (
@@ -24,24 +28,26 @@ const (
 )
 
 func checksum(b []byte) uint16 {
-	var sum uint32
-
-	for i := 0; i < len(b); i += 2 {
-		if i == len(b)-1 {
-			sum += uint32(b[i]) << 8
-		} else {
-			sum += uint32(binary.BigEndian.Uint16(b[i:]))
-		}
+	var ac uint64
+	i := 0
+	n := len(b)
+	for n >= 4 {
+		ac += uint64(binary.BigEndian.Uint32(b[i : i+4]))
+		n -= 4
+		i += 4
 	}
-
-	for {
-		if sum>>16 == 0 {
-			break
-		}
-		sum = (sum & 0xffff) + (sum >> 16)
+	for n >= 2 {
+		ac += uint64(binary.BigEndian.Uint16(b[i : i+2]))
+		n -= 2
+		i += 2
 	}
-
-	return uint16(^sum)
+	if n == 1 {
+		ac += uint64(b[i]) << 8
+	}
+	for (ac >> 16) > 0 {
+		ac = (ac >> 16) + (ac & 0xffff)
+	}
+	return uint16(^ac)
 }
 
 const (
@@ -66,28 +72,32 @@ type virtioNetHdr struct {
 	CSumOffset uint16
 }
 
+func (v *virtioNetHdr) decode(bo binary.ByteOrder, b []byte) error {
+	if len(b) < virtioNetHdrLen {
+		return errors.New("too shor")
+	}
+	v.Flags = b[0]
+	v.GSOType = b[1]
+	v.HdrLen = bo.Uint16(b[2:])
+	v.GSOSize = bo.Uint16(b[4:])
+	v.CSumStart = bo.Uint16(b[6:])
+	v.CSumOffset = bo.Uint16(b[8:])
+	return nil
+}
+
 type packetHandler struct {
 	reader            *bytes.Reader
 	tunAddr, tunRoute netip.Prefix
 	mode              tsoMode
 }
 
-func pseudoHeaderMinusLenFromPacket(b []byte) []byte {
-	ret := make([]byte, 10)
-	copy(ret[:4], b[12:16])
-	copy(ret[4:], b[16:20])
+func genTCP4PseudoHeader(src, dst [4]byte, tcpLen uint16) []byte {
+	ret := make([]byte, 12)
+	copy(ret[:4], src[:])
+	copy(ret[4:], dst[:])
 	ret[9] = unix.IPPROTO_TCP
+	binary.BigEndian.PutUint16(ret[10:], tcpLen)
 	return ret
-}
-
-func tcpChecksum(b []byte, pseudoHeaderMinusLen []byte) uint16 {
-	b[16], b[17] = 0, 0 // clear
-	tcpCsumData := make([]byte, len(pseudoHeaderMinusLen)+2+len(b[20:]))
-	copy(tcpCsumData, pseudoHeaderMinusLen)
-	binary.BigEndian.PutUint16(tcpCsumData[10:], uint16(len(b[20:])))
-	copy(tcpCsumData[12:], b[20:])
-	tcpCsum := checksum(tcpCsumData)
-	return tcpCsum
 }
 
 // handle handles the provided packet 'in'. If handle results in packets that
@@ -96,13 +106,14 @@ func tcpChecksum(b []byte, pseudoHeaderMinusLen []byte) uint16 {
 func (p *packetHandler) handle(in []byte, out [][]byte) ([]int, bool) {
 	p.reader.Reset(in)
 	var vnetHdr virtioNetHdr
+	var ipHLen int
 	inStartAtIPH := in
 
 	if p.mode > tsoModeOff {
-		if len(in) < virtioNetHdrLen {
+		err := vnetHdr.decode(binary.LittleEndian, in)
+		if err != nil {
 			return nil, false
 		}
-		err := binary.Read(p.reader, binary.LittleEndian, &vnetHdr)
 		if err != nil {
 			return nil, false
 		}
@@ -122,6 +133,7 @@ func (p *packetHandler) handle(in []byte, out [][]byte) ([]int, bool) {
 	if inStartAtIPH[0]&0x0F != 5 { // ignore ip options for now
 		return nil, false
 	}
+	ipHLen = 20
 	if inStartAtIPH[9] != unix.IPPROTO_TCP { // ignore non-tcp
 		return nil, false
 	}
@@ -144,15 +156,13 @@ func (p *packetHandler) handle(in []byte, out [][]byte) ([]int, bool) {
 
 	inStartAtIPH[10], inStartAtIPH[11] = 0, 0 // clear IPv4 checksum field
 
-	// psuedoheaderMinusLen for tcp checksum. We don't want len (yet) as it may
-	// vary for final segment.
-	psuedoHeaderMinusLen := pseudoHeaderMinusLenFromPacket(inStartAtIPH)
+	// the last 2 bytes (tcp len) can be filled in later
+	psuedoHeader := genTCP4PseudoHeader(srcAddr.As4(), dstAddr.As4(), 0)
 
-	tcpCsumAt := vnetHdr.CSumStart + vnetHdr.CSumOffset
+	tcpCsumAt := virtioNetHdrLen + vnetHdr.CSumStart + vnetHdr.CSumOffset
 	in[tcpCsumAt], in[tcpCsumAt+1] = 0, 0 // clear TCP checksum field before splitting
+	firstTCPSeq := binary.BigEndian.Uint32(in[virtioNetHdrLen+vnetHdr.CSumStart+4:])
 
-	// TODO: split segments
-	_ = psuedoHeaderMinusLen
 	nextSegmentAt := virtioNetHdrLen + int(vnetHdr.HdrLen)
 	sizes := make([]int, 0, len(out))
 	for i := 0; nextSegmentAt < len(in); i++ {
@@ -177,13 +187,26 @@ func (p *packetHandler) handle(in []byte, out [][]byte) ([]int, bool) {
 		// TCP header
 		startAtTCP := virtioNetHdrLen + vnetHdr.CSumStart
 		copy(out[i][startAtTCP:], in[startAtTCP:virtioNetHdrLen+vnetHdr.HdrLen])
-		// TODO: set TCP sequence number
-		// TODO: TCP checksum
-		fmt.Printf("len(in): %d vnetHdr: %+v nextSegmentAt: %d end: %d totalLen: %d\n", len(in), vnetHdr, nextSegmentAt, end, totalLen)
+		if i > 0 {
+			// TODO: overflow and stuff
+			tcpSeq := int(firstTCPSeq) + int(vnetHdr.GSOSize)*i
+			binary.BigEndian.PutUint32(out[i][startAtTCP+4:], uint32(tcpSeq))
+		}
 
 		// payload
 		copy(out[i][virtioNetHdrLen+vnetHdr.HdrLen:], in[nextSegmentAt:end])
-		sizes = append(sizes, totalLen)
+
+		// TCP checksum
+		tcpHLen := int(vnetHdr.HdrLen) - ipHLen
+		tcpLenForPseudo := tcpHLen + (end - nextSegmentAt)
+		binary.BigEndian.PutUint16(psuedoHeader[10:], uint16(tcpLenForPseudo))
+		tcpCSumData := make([]byte, 0, 3000)
+		tcpCSumData = append(tcpCSumData, psuedoHeader...)
+		tcpCSumData = append(tcpCSumData, out[i][startAtTCP:]...)
+		tcpCSum := checksum(tcpCSumData)
+		binary.BigEndian.PutUint16(out[i][startAtTCP+16:], tcpCSum)
+
+		sizes = append(sizes, virtioNetHdrLen+totalLen)
 		nextSegmentAt += int(vnetHdr.GSOSize)
 	}
 	return sizes, true
@@ -226,6 +249,12 @@ func (t tsoMode) String() string {
 
 func main() {
 	flag.Parse()
+
+	if len(*flagPprofAddr) > 0 {
+		go func() {
+			log.Fatal(http.ListenAndServe(*flagPprofAddr, nil))
+		}()
+	}
 
 	tunAddr, err := netip.ParsePrefix(*flagTunAddr)
 	if err != nil {
@@ -288,12 +317,6 @@ func main() {
 		sizes, ok := handler.handle(in[:n], out)
 		if !ok {
 			continue
-		}
-		if len(sizes) > 1 {
-			log.Printf("in minus virtio: %x\n", in[virtioNetHdrLen:n])
-			for i := 0; i < len(sizes); i++ {
-				log.Printf("out[%d] minus virtio: %x\n", i, out[i][virtioNetHdrLen:sizes[i]])
-			}
 		}
 		for i := 0; i < len(sizes); i++ {
 			_, err = f.Write(out[i][:sizes[i]])
