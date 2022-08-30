@@ -118,9 +118,6 @@ func (p *packetHandler) handle(in []byte, out [][]byte) ([]int, bool) {
 		if err != nil {
 			return nil, false
 		}
-		if err != nil {
-			return nil, false
-		}
 		if vnetHdr.GSOType&VIRTIO_NET_HDR_GSO_NONE|VIRTIO_NET_HDR_GSO_TCPV4 == 0 {
 			return nil, false
 		}
@@ -147,7 +144,8 @@ func (p *packetHandler) handle(in []byte, out [][]byte) ([]int, bool) {
 
 	if p.mode < tsoModeSplit || vnetHdr.GSOType == VIRTIO_NET_HDR_GSO_NONE {
 		copy(out[0], in)
-		return []int{len(in)}, true
+		p.sizes[0] = len(in)
+		return p.sizes[:1], true
 	}
 
 	inStartAtIPH[10], inStartAtIPH[11] = 0, 0 // clear IPv4 checksum field
