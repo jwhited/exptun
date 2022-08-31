@@ -97,6 +97,16 @@ func (v *virtioNetHdr) decode(bo binary.ByteOrder, b []byte) error {
 	return nil
 }
 
+func newPacketHandler(tunAddr, tunRoute netip.Prefix, mode tsoMode) *packetHandler {
+	ph := &packetHandler{
+		tunAddr:  tunAddr,
+		tunRoute: tunRoute,
+		mode:     mode,
+		sizes:    make([]int, 128),
+	}
+	return ph
+}
+
 type packetHandler struct {
 	tunAddr, tunRoute netip.Prefix
 	mode              tsoMode
@@ -161,13 +171,15 @@ func (p *packetHandler) handle(in []byte, out [][]byte) ([]int, bool) {
 	in[tcpCsumAt], in[tcpCsumAt+1] = 0, 0 // clear TCP checksum field before splitting
 	firstTCPSeq := binary.BigEndian.Uint32(in[virtioNetHdrLen+vnetHdr.CSumStart+4:])
 
-	nextSegmentAt := virtioNetHdrLen + int(vnetHdr.HdrLen)
+	nextSegmentStart := virtioNetHdrLen + int(vnetHdr.HdrLen)
 	numSegments := 0
-	for i := 0; nextSegmentAt < len(in); i++ {
-		end := nextSegmentAt + int(vnetHdr.GSOSize)
-		if end > len(in) {
-			end = len(in)
+	for i := 0; nextSegmentStart < len(in); i++ {
+		nextSegmentEnd := nextSegmentStart + int(vnetHdr.GSOSize)
+		if nextSegmentEnd > len(in) {
+			nextSegmentEnd = len(in)
 		}
+		segmentLen := nextSegmentEnd - nextSegmentStart
+		headersLen := virtioNetHdrLen + vnetHdr.HdrLen
 
 		// empty virtioNetHdr
 		outVNetHdr := virtioNetHdr{}
@@ -184,7 +196,7 @@ func (p *packetHandler) handle(in []byte, out [][]byte) ([]int, bool) {
 		// IPv4 header
 		startAtIPH := virtioNetHdrLen
 		copy(out[i][startAtIPH:], inStartAtIPH[:20])
-		totalLen := int(vnetHdr.HdrLen) + (end - nextSegmentAt)
+		totalLen := int(vnetHdr.HdrLen) + segmentLen
 		binary.BigEndian.PutUint16(out[i][startAtIPH+2:], uint16(totalLen))
 		// When splitting we always want to compute a valid iph checksum. We
 		// can't offload this back to the kernel.
@@ -192,8 +204,8 @@ func (p *packetHandler) handle(in []byte, out [][]byte) ([]int, bool) {
 		binary.BigEndian.PutUint16(out[i][startAtIPH+10:], ipv4CSum)
 
 		// TCP header
-		startAtTCP := virtioNetHdrLen + vnetHdr.CSumStart
-		copy(out[i][startAtTCP:], in[startAtTCP:virtioNetHdrLen+vnetHdr.HdrLen])
+		startAtTCP := virtioNetHdrLen + int(vnetHdr.CSumStart)
+		copy(out[i][startAtTCP:], in[startAtTCP:headersLen])
 		if i > 0 {
 			// TODO: overflow and stuff
 			tcpSeq := int(firstTCPSeq) + int(vnetHdr.GSOSize)*i
@@ -201,22 +213,22 @@ func (p *packetHandler) handle(in []byte, out [][]byte) ([]int, bool) {
 		}
 
 		// payload
-		copy(out[i][virtioNetHdrLen+vnetHdr.HdrLen:], in[nextSegmentAt:end])
+		copy(out[i][headersLen:], in[nextSegmentStart:nextSegmentEnd])
 
 		// TCP checksum
 		if p.mode == tsoModeSplit {
 			tcpHLen := int(vnetHdr.HdrLen) - ipHLen
-			tcpLenForPseudo := tcpHLen + (end - nextSegmentAt)
+			tcpLenForPseudo := tcpHLen + segmentLen
 			binary.BigEndian.PutUint16(p.psuedoHeader[10:], uint16(tcpLenForPseudo))
 			copy(p.buff[:], p.psuedoHeader[:])
-			copy(p.buff[len(p.psuedoHeader):], out[i][startAtTCP:])
-			tcpCSum := checksum(p.buff[:len(p.psuedoHeader)+len(out[i][startAtTCP:])])
+			copy(p.buff[len(p.psuedoHeader):], out[i][startAtTCP:startAtTCP+tcpLenForPseudo])
+			tcpCSum := checksum(p.buff[:len(p.psuedoHeader)+len(out[i][startAtTCP:startAtTCP+tcpLenForPseudo])])
 			binary.BigEndian.PutUint16(out[i][startAtTCP+16:], tcpCSum)
 		}
 
 		p.sizes[i] = virtioNetHdrLen + totalLen
 		numSegments++
-		nextSegmentAt += int(vnetHdr.GSOSize)
+		nextSegmentStart += int(vnetHdr.GSOSize)
 	}
 	return p.sizes[:numSegments], true
 }
@@ -310,18 +322,13 @@ func main() {
 	for i := 0; i < len(out); i++ {
 		out[i] = make([]byte, 65535)
 	}
-	handler := &packetHandler{
-		tunAddr:  tunAddr,
-		tunRoute: tunRoute,
-		mode:     mode,
-		sizes:    make([]int, 128),
-	}
+	ph := newPacketHandler(tunAddr, tunRoute, mode)
 	for {
 		n, err := f.Read(in)
 		if err != nil {
 			log.Fatalf("error reading from TUN: %v", err)
 		}
-		sizes, ok := handler.handle(in[:n], out)
+		sizes, ok := ph.handle(in[:n], out)
 		if !ok {
 			continue
 		}
